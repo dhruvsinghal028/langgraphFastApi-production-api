@@ -5,6 +5,7 @@ Input sanitization, PII detection/masking, output validation.
 
 import re
 from typing import Optional
+
 from langsmith import traceable
 
 # === Input Sanitization ===
@@ -145,7 +146,7 @@ class SecurityPipeline:
         self.pii_detector = PIIDetector()
         self.output_validator = OutputValidator()
 
-    @traceable(name="security_check_input")
+    # @traceable(name="security_check_input")
     def check_input(self, text: str) -> tuple[bool, str, list[str]]:
         """
         Process input through security checks.
@@ -169,7 +170,7 @@ class SecurityPipeline:
 
         return True, cleaned, notes
 
-    @traceable(name="security_check_output")
+    # @traceable(name="security_check_output")
     def check_output(self, text: str) -> tuple[str, list[str]]:
         """
         Validate output before returning to client.
