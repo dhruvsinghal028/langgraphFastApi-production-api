@@ -1,119 +1,102 @@
-"""
-Response Caching Layer
-In-memory cache with TTL for LLM response deduplication.
-"""
-
-import hashlib
 import time
 from typing import Optional
+
+import psycopg
+from openai import AsyncOpenAI
 
 
 class ResponseCache:
     """
-    In-memory response cache with TTL (time-to-live).
-
-    In production, replace this with Redis for:
-    - Persistence across restarts
-    - Shared cache across multiple instances
-    - Built-in TTL management
+    Semantic caching using Neon PostgreSQL, pgvector, and OpenAI Embeddings.
     """
 
-    def __init__(self, ttl_seconds: int = 300):
+    def __init__(
+        self,
+        db_url: str,
+        openai_api_key: str,
+        ttl_seconds: int = 300,
+        similarity_threshold: float = 0.15,
+    ):
+        self.db_url = db_url
         self.ttl = ttl_seconds
-        self._cache: dict[str, dict] = {}
+        self.threshold = similarity_threshold
+        # Initialize the OpenAI client for generating embeddings
+        self.client = AsyncOpenAI(api_key=openai_api_key)
         self._hits = 0
         self._misses = 0
 
-    def _make_key(self, query: str) -> str:
-        """Create a cache key from the normalized query."""
-        normalized = query.lower().strip()
-        return hashlib.sha256(normalized.encode()).hexdigest()
+    async def setup(self) -> None:
+        """Create the semantic cache table and ensure pgvector is active."""
+        async with await psycopg.AsyncConnection.connect(self.db_url) as conn:
+            async with conn.cursor() as cur:
+                # Double-check pgvector is enabled on this Neon database
+                await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
-    # 'What is Python?' and 'what is python?'
+                # Create the semantic table (Notice the VECTOR(1536) column)
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS semantic_cache (
+                        id SERIAL PRIMARY KEY,
+                        query TEXT NOT NULL,
+                        response TEXT NOT NULL,
+                        embedding VECTOR(1536),
+                        timestamp FLOAT NOT NULL
+                    )
+                """)
+                await conn.commit()
 
-    def get(self, query: str) -> Optional[str]:
-        """
-        Get cached response if it exists and hasn't expired.
-        Returns None on cache miss.
-        """
-        key = self._make_key(query)
+    async def _get_embedding(self, text: str) -> list[float]:
+        """Call OpenAI to generate a 1,536-dimension vector array for the text."""
+        response = await self.client.embeddings.create(
+            model="text-embedding-3-small", input=text
+        )
+        return response.data[0].embedding
 
-        if key in self._cache:
-            entry = self._cache[key]
-            # Check TTL
-            if time.time() - entry["timestamp"] < self.ttl:
-                self._hits += 1
-                return entry["response"]
-            else:
-                # Expired - remove it
-                del self._cache[key]
+    async def get(self, query: str) -> Optional[str]:
+        """Semantic search using Cosine Distance."""
+        # 1. Turn the user's string query into math
+        query_vector = await self._get_embedding(query)
+
+        async with await psycopg.AsyncConnection.connect(self.db_url) as conn:
+            async with conn.cursor() as cur:
+                # 2. Find the closest match in Neon using <=> (Cosine Distance)
+                # We cast the python list to a vector using ::vector
+                await cur.execute(
+                    """
+                    SELECT response, timestamp, (embedding <=> %s::vector) AS distance
+                    FROM semantic_cache
+                    ORDER BY distance ASC
+                    LIMIT 1
+                """,
+                    (query_vector,),
+                )
+
+                row = await cur.fetchone()
+
+                if row:
+                    response_text, timestamp, distance = row
+
+                    # 3. Check if it means the same thing AND hasn't expired
+                    if distance <= self.threshold and (
+                        time.time() - timestamp < self.ttl
+                    ):
+                        self._hits += 1
+                        return response_text
 
         self._misses += 1
         return None
 
-    def set(self, query: str, response: str) -> None:
-        """Cache a response."""
-        key = self._make_key(query)
-        self._cache[key] = {
-            "response": response,
-            "timestamp": time.time(),
-            "query": query,
-        }
+    async def set(self, query: str, response: str) -> None:
+        """Cache the response alongside its semantic embedding."""
+        embedding = await self._get_embedding(query)
+        timestamp = time.time()
 
-    @property
-    def stats(self) -> dict:
-        """Cache performance statistics."""
-        total = self._hits + self._misses
-        hit_rate = self._hits / total if total > 0 else 0.0
-        return {
-            "hits": self._hits,
-            "misses": self._misses,
-            "hit_rate": f"{hit_rate:.1%}",
-            "cached_entries": len(self._cache),
-        }
-
-
-
-
-
-
-# uv run python -c "
-# import time
-# from app.cache import ResponseCache
-
-# cache = ResponseCache(ttl_seconds=3)  # Short TTL for demo
-
-# print('=== CACHE DEMO ===')
-# print()
-
-# # Miss
-# result = cache.get('What is Python?')
-# print(f'1. First lookup: {result}  (miss - nothing cached yet)')
-
-# # Store
-# cache.set('What is Python?', 'Python is a programming language.')
-# print(f'2. Stored response in cache')
-
-# # Hit
-# result = cache.get('What is Python?')
-# print(f'3. Second lookup: {result}  (HIT!)')
-
-# # Case insensitive
-# result = cache.get('what is python?')
-# print(f'4. Lowercase lookup: {result}  (HIT - case insensitive!)')
-
-# # Different query = miss
-# result = cache.get('What is JavaScript?')
-# print(f'5. Different query: {result}  (miss)')
-
-# # Stats
-# print(f'6. Stats: {cache.stats}')
-
-# # Wait for TTL
-# print(f'7. Waiting 4 seconds for TTL expiration...')
-# time.sleep(4)
-
-# result = cache.get('What is Python?')
-# print(f'8. After TTL: {result}  (miss - expired!)')
-# print(f'9. Final stats: {cache.stats}')
-# "
+        async with await psycopg.AsyncConnection.connect(self.db_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO semantic_cache (query, response, embedding, timestamp)
+                    VALUES (%s, %s, %s::vector, %s)
+                """,
+                    (query, response, embedding, timestamp),
+                )
+                await conn.commit()

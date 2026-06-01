@@ -16,13 +16,14 @@ class Settings(BaseSettings):
 
     # LLM Configuration
     openai_api_key: str
+    database_url: str  # adding this for Neo postgre Integration
     primary_model: str = "gpt-4o-mini"
     fallback_model: str = "gpt-4o-mini"
 
-    # LangSmith
-    langchain_tracing_v2: bool = True
-    langchain_api_key: str = ""
-    langchain_project: str = "production-api"
+    # # LangSmith
+    # langchain_tracing_v2: bool = True
+    # langchain_api_key: str = ""
+    # langchain_project: str = "production-api"
 
     # Application
     app_env: str = "development"

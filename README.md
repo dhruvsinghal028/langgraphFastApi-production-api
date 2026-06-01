@@ -28,9 +28,9 @@ cd langgraphFastApi-production-api
 uv sync
 
 **3. create .env  **
-Create a .env file in the root directory. And set the below varibles in it 
+# Create a .env file in the root directory. And set the below varibles in it 
 
-Code snippet
+# Code snippet
 OPENAI_API_KEY=your_api_key_here
 PRIMARY_MODEL=gpt-4o-mini
 FALLBACK_MODEL=gpt-3.5-turbo
