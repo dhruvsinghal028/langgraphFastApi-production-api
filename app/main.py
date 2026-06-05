@@ -1,24 +1,29 @@
 """
-Production-Ready FastAPI + LangGraph Application
+Production-Ready API + LangGraph Application
 
 Wires together:
 - Security pipeline (input sanitization, PII masking)
 - Response caching
 - Rate limiting (slowapi)
-- LangGraph agent (with retries + fallback)
+- LangGraph agent (with retries + fallback + stateful memory)
 - Structured logging + metrics
 - LangSmith tracing
 - Health checks
 """
 
+import asyncio  # --- NEW CHANGE: Imported for Windows fix
 import os
+import sys  # --- NEW CHANGE: Imported for Windows fix
 import time
 from contextlib import asynccontextmanager
 
-# from langsmith import traceable
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+# --- NEW CHANGE: Import Neon Postgres Checkpointer dependencies ---
+from psycopg_pool import AsyncConnectionPool
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -38,12 +43,17 @@ from app.security import SecurityPipeline
 
 load_dotenv()
 
+# --- NEW CHANGE: The Windows Event Loop Fix ---
+# Forces the compatible Selector engine on Windows machines so psycopg doesn't crash
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # === Global instances (initialized in lifespan) ===
 security: SecurityPipeline = None
 cache: ResponseCache = None
 metrics: MetricsCollector = None
 agent: ProductionAgent = None
+db_pool: AsyncConnectionPool = None  # --- NEW CHANGE: Track the database pool globally
 logger = get_logger()
 
 
@@ -54,9 +64,9 @@ logger = get_logger()
 async def lifespan(app: FastAPI):
     """
     Initialize all components on startup, clean up on shutdown.
-    This is the modern FastAPI pattern (replaces @app.on_event).
+    This is the modern pattern (replaces @app.on_event).
     """
-    global security, cache, metrics, agent
+    global security, cache, metrics, agent, db_pool  # --- NEW CHANGE: Added db_pool here
 
     settings = get_settings()
 
@@ -78,11 +88,23 @@ async def lifespan(app: FastAPI):
         openai_api_key=settings.openai_api_key,
         ttl_seconds=settings.cache_ttl_seconds,
     )
-    # Build the table in Neon before starting the server
+    # Build the cache table in Neon before starting the server
     await cache.setup()
 
+    # --- NEW CHANGE: Initialize Neon Database Pool and Checkpointer ---
+    # 1. Open background pipes to Neon
+    db_pool = AsyncConnectionPool(settings.database_url)
+    await db_pool.open()
+
+    # 2. Set up the checkpointer translator and run migrations (create tables)
+    checkpointer = AsyncPostgresSaver(db_pool)
+    await checkpointer.setup()
+    # ------------------------------------------------------------------
+
     metrics = MetricsCollector()
-    agent = ProductionAgent()
+
+    # --- NEW CHANGE: Pass the checkpointer into your agent ---
+    agent = ProductionAgent(checkpointer=checkpointer)
 
     logger.info("All components initialized. Ready to serve requests.")
 
@@ -91,12 +113,16 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down...", extra={"extra_data": metrics.summary})
 
-    # === Rate Limiter Setup ===
+    # --- NEW CHANGE: Safely close the database connection pool on shutdown ---
+    if db_pool:
+        await db_pool.close()
 
+
+# === Rate Limiter Setup ===
 
 limiter = Limiter(key_func=get_remote_address)
 
-# === FastAPI App ===
+# === App Initialization ===
 app = FastAPI(
     title="Production LangGraph API",
     description="A production-ready chat API with security, caching, and observability.",
@@ -149,14 +175,6 @@ async def chat(request: Request, body: ChatRequest):
     5. Cache store
     6. Return response
     """
-    # client = AsyncOpenAI(api_key=get_settings.openai_api_key)
-
-    # async def get_embedding(text: str) -> list[float]:
-    #     response = await client.embeddings.create(
-    #         model="text-embedding-3-small", input=text
-    #     )
-    #     return response.data[0].embedding
-
     with RequestTimer() as timer:
         security_notes = []
 
@@ -202,7 +220,11 @@ async def chat(request: Request, body: ChatRequest):
 
         # ---- Step 3: Invoke LangGraph Agent ----
         try:
-            result = agent.invoke(cleaned_message)
+            # --- NEW CHANGE: Create config and call using ainvoke ---
+            # This passes the user's thread_id to the DB so it pulls the correct memory
+            config = {"configurable": {"thread_id": body.thread_id}}
+            result = await agent.ainvoke(cleaned_message, config=config)
+            # --------------------------------------------------------
         except Exception as e:
             logger.error(
                 f"Agent invocation failed: {e}",
@@ -281,6 +303,7 @@ async def health():
         "agent": agent is not None,
         "security": security is not None,
         "cache": cache is not None,
+        "db_pool": db_pool is not None,  # --- NEW CHANGE: Added db_pool check here
     }
 
     all_healthy = all(checks.values())
